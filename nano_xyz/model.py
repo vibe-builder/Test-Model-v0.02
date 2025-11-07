@@ -1205,10 +1205,6 @@ class ModelSettings:
         # Validate KV cache parameters
         if self.max_cache_len <= 0:
             self.max_cache_len = self.block_size
-        elif self.max_cache_len > self.block_size:
-            raise ValueError(
-                f"max_cache_len ({self.max_cache_len}) cannot exceed block_size ({self.block_size})"
-            )
         # Validate attention sink parameters
         if self.attention_sink_size <= 0:
             raise ValueError(f"attention_sink_size must be positive, got {self.attention_sink_size}")
