@@ -5,5 +5,19 @@ __pycache__/
 .pytest_cache/
 *.log
 *.tmp
-
+*.bak
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+dist/
+build/
+*.egg
+.coverage
+htmlcov/
+.tox/
+.env
+.env.local
+.env.*.local
 
