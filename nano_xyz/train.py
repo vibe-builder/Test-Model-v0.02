@@ -511,8 +511,18 @@ def main():
     processor = TextProcessor(tokenizer_name=args.tokenizer_name, vocab_size=args.vocab_size)
     logger.info(f"Tokenizer vocab_size: {processor.vocab_size}")
     
-    # Create config dict from args, override vocab_size from tokenizer
-    config_dict = vars(args).copy()
+    # Create config dict from args, only include model architecture parameters
+    # ModelSettings should only receive parameters related to model architecture/configuration
+    model_config_params = {
+        'block_size', 'vocab_size', 'n_layer', 'n_head', 'n_embd', 'dropout', 'bias',
+        'n_kv_groups', 'sliding_window', 'dtype', 'use_fused_attention',
+        'attn_logit_softcapping', 'use_fp32_softmax', 'use_yarn', 'yarn_orig_ctx',
+        'yarn_target_ctx', 'yarn_alpha', 'yarn_beta', 'rope_base', 'use_lcr',
+        'use_gtr', 'lcr_kernel_size', 'lcr_expand', 'gtr_num_tokens', 'max_cache_len',
+        'use_activation_checkpointing', 'use_attention_sinks', 'attention_sink_size'
+    }
+
+    config_dict = {k: v for k, v in vars(args).items() if k in model_config_params}
     config_dict['vocab_size'] = processor.vocab_size
     config_dict['dtype'] = None  # Auto-detect based on device capabilities
 
