@@ -207,3 +207,81 @@ class TestTextGenerator:
         assert result_stop.shape[0] == 1
 
         print("Generator sampling guardrails test passed!")
+
+    def test_generate_batch_respects_stop_tokens(self, monkeypatch):
+        """Ensure generate_batch forwards per-sequence stop tokens and slices outputs correctly."""
+        config = ModelSettings(n_layer=2, n_head=4, n_embd=64, block_size=16)
+        model = ModelArchitecture(config)
+        generator = TextGenerator(model=model)
+
+        invoked_stop_tokens = []
+
+        def fake_generate(self, token_ids, max_new_tokens, temperature=1.0, top_k=None, top_p=None, stop_token=None):
+            invoked_stop_tokens.append(stop_token)
+            batch_size, seq_len = token_ids.shape
+            new_vals = torch.full((batch_size, max_new_tokens), 9, dtype=token_ids.dtype, device=token_ids.device)
+            return torch.cat([token_ids, new_vals], dim=1)
+
+        monkeypatch.setattr(TextGenerator, "generate", fake_generate, raising=False)
+
+        seq_a = torch.tensor([1, 2, 3], dtype=torch.long)
+        seq_b = torch.tensor([4, 5], dtype=torch.long)
+        stop_tokens = [42, None]
+
+        outputs = generator.generate_batch(
+            [seq_a, seq_b],
+            max_new_tokens=3,
+            temperature=0.8,
+            top_k=5,
+            top_p=0.9,
+            stop_tokens=stop_tokens,
+            pad_token_id=0
+        )
+
+        assert invoked_stop_tokens == stop_tokens
+        assert len(outputs) == 2
+        for out in outputs:
+            assert torch.equal(out, torch.tensor([9, 9, 9], dtype=torch.long))
+
+    def test_long_prompt_preserves_chronology(self):
+        """Ensure prompts longer than block_size are consumed in original order."""
+        config = ModelSettings(
+            n_layer=2,
+            n_head=4,
+            n_embd=64,
+            block_size=4,
+            max_cache_len=16,
+            use_yarn=True,
+            yarn_orig_ctx=4,
+            yarn_target_ctx=16,
+        )
+        model = ModelArchitecture(config)
+        generator = TextGenerator(model=model)
+
+        prompt = torch.arange(0, 8, dtype=torch.long, device=generator.device).unsqueeze(0)
+        generated = generator.generate(prompt, max_new_tokens=1)
+
+        assert torch.equal(
+            generated[:, : prompt.size(1)].to("cpu"),
+            prompt.to("cpu")
+        )
+
+    def test_max_new_tokens_zero_processes_overflow(self):
+        """Ensure max_new_tokens=0 still ingests the entire prompt."""
+        config = ModelSettings(
+            n_layer=2,
+            n_head=4,
+            n_embd=64,
+            block_size=4,
+            max_cache_len=32,
+            use_yarn=True,
+            yarn_orig_ctx=4,
+            yarn_target_ctx=32,
+        )
+        model = ModelArchitecture(config)
+        generator = TextGenerator(model=model)
+
+        prompt = torch.arange(0, 10, dtype=torch.long, device=generator.device).unsqueeze(0)
+        result = generator.generate(prompt, max_new_tokens=0)
+
+        assert result.shape[1] == prompt.size(1)

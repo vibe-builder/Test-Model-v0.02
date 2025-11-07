@@ -62,3 +62,35 @@ class TestDatasetComponents:
         finally:
             # Clean up temp file
             os.unlink(temp_file)
+
+    def test_auto_streaming_initializes_cache(self, tmp_path, monkeypatch):
+        """Ensure auto-enabled streaming mode still has cache attributes."""
+        test_file = tmp_path / "data.txt"
+        test_file.write_text("hello world", encoding="utf-8")
+
+        processor = TextProcessor(vocab_size=1000)
+
+        original_getsize = os.path.getsize
+
+        def fake_getsize(path):
+            if path == str(test_file):
+                return 600 * 1024 * 1024  # Force >500MB
+            return original_getsize(path)
+
+        monkeypatch.setattr(os.path, "getsize", fake_getsize)
+
+        dataset = TextFileDataset(str(test_file), processor, block_size=8, streaming=False)
+
+        assert dataset.streaming, "Streaming should auto-enable for large files"
+        assert hasattr(dataset, "token_cache")
+        assert isinstance(dataset.token_cache, dict)
+
+    def test_invalid_overlap_raises(self, tmp_path):
+        """Overlap must be less than block_size."""
+        test_file = tmp_path / "data.txt"
+        test_file.write_text("sample text", encoding="utf-8")
+
+        processor = TextProcessor(vocab_size=1000)
+
+        with pytest.raises(ValueError, match="overlap.*block_size"):
+            TextFileDataset(str(test_file), processor, block_size=8, overlap=8)

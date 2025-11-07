@@ -42,17 +42,24 @@ class TextFileDataset(Dataset):
             stream_chunk_size: Size of text chunks to process at once (in bytes)
         """
         self.processor = processor
+        if overlap < 0:
+            raise ValueError(f"overlap ({overlap}) must be >= 0")
+        if overlap >= block_size:
+            raise ValueError(
+                f"overlap ({overlap}) must be less than block_size ({block_size})"
+            )
+
         self.block_size = block_size
         self.overlap = overlap
+        self.stride = self.block_size - self.overlap
         self.streaming = streaming
         self.stream_chunk_size = stream_chunk_size
 
-        # Initialize cache for streaming mode
-        if self.streaming:
-            self.token_cache = {}  # Cache tokenized file chunks: {file_chunk_idx: tokens}
-            self.cache_size_limit = 10  # Maximum cached chunks to prevent unbounded memory usage
-            self._cache_accesses = 0  # Track cache access statistics
-            self._cache_hits = 0
+        # Initialize cache bookkeeping regardless of initial streaming flag. Streaming may be auto-enabled later.
+        self.token_cache = {}  # Cache tokenized file chunks: {file_chunk_idx: tokens}
+        self.cache_size_limit = 10  # Maximum cached chunks to prevent unbounded memory usage
+        self._cache_accesses = 0  # Track cache access statistics
+        self._cache_hits = 0
 
         import os
         import time
@@ -69,8 +76,12 @@ class TextFileDataset(Dataset):
             tokenize_start = time.time()
             self.tokens = self.processor.encode(text)
             tokenize_time = time.time() - tokenize_start
+            if tokenize_time > 0:
+                tokens_per_sec = f"{len(self.tokens)/tokenize_time:.0f}"
+            else:
+                tokens_per_sec = "N/A"
             print(f"Tokenized {len(self.tokens)} tokens in {tokenize_time:.2f}s "
-                  f"({len(self.tokens)/tokenize_time:.0f} tokens/sec)")
+                  f"({tokens_per_sec} tokens/sec)")
 
             chunk_start = time.time()
             self.chunks = self._create_chunks()
@@ -113,8 +124,12 @@ class TextFileDataset(Dataset):
                 tokenize_start = time.time()
                 self.tokens = self.processor.encode(text)
                 tokenize_time = time.time() - tokenize_start
+                if tokenize_time > 0:
+                    tokens_per_sec = f"{len(self.tokens)/tokenize_time:.0f}"
+                else:
+                    tokens_per_sec = "N/A"
                 print(f"Tokenized {len(self.tokens)} tokens in {tokenize_time:.2f}s "
-                      f"({len(self.tokens)/tokenize_time:.0f} tokens/sec)")
+                      f"({tokens_per_sec} tokens/sec)")
 
                 chunk_start = time.time()
                 self.chunks = self._create_chunks()
@@ -318,14 +333,12 @@ class TextFileDataset(Dataset):
                   f"No chunks will be created. Consider using a smaller block_size or more data.")
             return chunks
 
-        stride = self.block_size - self.overlap
-
-        for i in range(0, len(self.tokens) - self.block_size + 1, stride):
+        for i in range(0, len(self.tokens) - self.block_size + 1, self.stride):
             chunk = self.tokens[i:i + self.block_size]
             chunks.append(chunk)
 
         # Add last chunk if needed
-        if len(self.tokens) % stride != 0:
+        if len(self.tokens) % self.stride != 0:
             last_start = len(self.tokens) - self.block_size
             if last_start > 0:
                 chunks.append(self.tokens[last_start:])
@@ -336,12 +349,11 @@ class TextFileDataset(Dataset):
         if self.streaming:
             # Calculate total training chunks from file chunk metadata
             total_training_chunks = 0
-            stride = self.block_size - self.overlap
 
             for _, _, estimated_tokens in self.chunks:
                 if estimated_tokens >= self.block_size:
                     # Estimate how many training chunks this file chunk can produce
-                    chunks_from_file_chunk = max(1, (estimated_tokens - self.block_size) // stride + 1)
+                    chunks_from_file_chunk = max(1, (estimated_tokens - self.block_size) // self.stride + 1)
                     total_training_chunks += chunks_from_file_chunk
 
             return max(1, total_training_chunks)  # Ensure at least 1 for empty files
@@ -381,15 +393,13 @@ class TextFileDataset(Dataset):
     def _get_streaming_chunk(self, idx: int) -> List[int]:
         """Get a chunk in streaming mode by loading data on demand with caching."""
         # Calculate which file chunk this training sample belongs to
-        stride = self.block_size - self.overlap
-
         # Find which file chunk contains this training sample
         cumulative_chunks = 0
         file_chunk_idx = 0
 
         for i, (_, _, estimated_tokens) in enumerate(self.chunks):
             if estimated_tokens >= self.block_size:
-                chunks_from_file_chunk = max(1, (estimated_tokens - self.block_size) // stride + 1)
+                chunks_from_file_chunk = max(1, (estimated_tokens - self.block_size) // self.stride + 1)
                 if cumulative_chunks + chunks_from_file_chunk > idx:
                     file_chunk_idx = i
                     chunk_within_file = idx - cumulative_chunks
@@ -403,7 +413,7 @@ class TextFileDataset(Dataset):
             file_chunk_idx = len(self.chunks) - 1
             # Find a valid chunk within this file chunk
             _, _, estimated_tokens = self.chunks[file_chunk_idx]
-            max_chunks_in_file = max(1, (estimated_tokens - self.block_size) // stride + 1)
+            max_chunks_in_file = max(1, (estimated_tokens - self.block_size) // self.stride + 1)
             chunk_within_file = min(idx - cumulative_chunks, max_chunks_in_file - 1)
 
         # Check cache first
@@ -420,7 +430,7 @@ class TextFileDataset(Dataset):
         tokens = self.token_cache[file_chunk_idx]
 
         # Extract the specific training chunk
-        token_start = chunk_within_file * stride
+        token_start = chunk_within_file * self.stride
         if token_start + self.block_size > len(tokens):
             # Last chunk of this file chunk - take the final block_size tokens
             if len(tokens) >= self.block_size:

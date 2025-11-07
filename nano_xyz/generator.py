@@ -128,9 +128,10 @@ class TextGenerator:
             full_input = full_input[:, -max_context:]
 
         prefill_limit = min(self.config.block_size, full_input.size(1))
-        prefill_context = full_input[:, -prefill_limit:]
-        overflow_tokens = full_input[:, :-prefill_limit]
+        prefill_context = full_input[:, :prefill_limit]
+        overflow_tokens = full_input[:, prefill_limit:]
         token_ids = prefill_context.clone()
+        absolute_pos = token_ids.size(1)
 
         # Use processor's EOS token if stop_token is None and processor is available
         if stop_token is None:
@@ -149,10 +150,6 @@ class TextGenerator:
         cuda_enabled = self.device.type == "cuda" and torch.cuda.is_available()
         if cuda_enabled:
             torch.cuda.reset_peak_memory_stats(self.device)
-
-        # Early return if no tokens to generate
-        if max_new_tokens <= 0:
-            return token_ids
 
         # Initialize KV cache for efficient generation
         past_key_values = None
@@ -183,16 +180,82 @@ class TextGenerator:
                     past_key_values = None
                     use_cache = False
 
-            forced_queue = list(torch.split(overflow_tokens, 1, dim=1)) if overflow_tokens.numel() > 0 else []
-            current_pos = token_ids.size(1)
+            def _trim_context() -> None:
+                nonlocal token_ids, past_key_values
+                if token_ids.size(1) > max_context:
+                    token_ids = token_ids[:, -max_context:]
+                if past_key_values is not None and len(past_key_values) > 0:
+                    if max_cache_len:
+                        cache_len = past_key_values[0][0].shape[2]
+                        if cache_len > max_cache_len:
+                            past_key_values = [
+                                (k[..., -max_cache_len:, :], v[..., -max_cache_len:, :])
+                                for k, v in past_key_values
+                            ]
+                    past_key_values = [
+                        (k[..., -max_context:, :], v[..., -max_context:, :])
+                        for k, v in past_key_values
+                    ]
+
+            def _ingest_chunk(chunk: torch.Tensor) -> Optional[torch.Tensor]:
+                nonlocal past_key_values, token_ids, absolute_pos, use_cache
+                if chunk.numel() == 0:
+                    return current_logits
+                try:
+                    with amp_context(self.config, self.device):
+                        position_ids_chunk = torch.arange(
+                            absolute_pos,
+                            absolute_pos + chunk.size(1),
+                            device=self.device,
+                        ).unsqueeze(0)
+                        result_chunk = self.model(
+                            chunk,
+                            use_cache=use_cache,
+                            position_ids=position_ids_chunk,
+                            past_key_values=past_key_values,
+                            return_full_logits=False,
+                        )
+                        if len(result_chunk) == 3:
+                            logits_chunk, _, past_key_values_inner = result_chunk
+                        else:
+                            logits_chunk, _ = result_chunk
+                            past_key_values_inner = None
+                            use_cache = False
+                    past_key_values = past_key_values_inner
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    logger.warning("OOM detected during overflow ingestion; cleared cache and skipping this chunk")
+                    return None
+
+                token_ids = torch.cat((token_ids, chunk), dim=1)
+                absolute_pos += chunk.size(1)
+                _trim_context()
+                return logits_chunk
+
+            # Efficiently ingest any overflow tokens before sampling
+            if overflow_tokens.numel() > 0:
+                chunk_size = min(self.config.block_size, overflow_tokens.size(1))
+                for start in range(0, overflow_tokens.size(1), chunk_size):
+                    chunk = overflow_tokens[:, start:start + chunk_size]
+                    current_logits = _ingest_chunk(chunk)
+                    if current_logits is None:
+                        return token_ids
+
+            if max_new_tokens <= 0:
+                return token_ids
+
             step_index = 0
             generated = 0
 
             def advance(next_token: torch.Tensor, step_idx: int, forced: bool) -> Optional[torch.Tensor]:
-                nonlocal past_key_values, token_ids, current_pos, use_cache
+                nonlocal past_key_values, token_ids, absolute_pos, use_cache
                 try:
                     with amp_context(self.config, self.device):
-                        position_ids_inner = torch.tensor([[current_pos]], device=self.device)
+                        position_ids_inner = torch.arange(
+                            absolute_pos,
+                            absolute_pos + next_token.size(1),
+                            device=self.device,
+                        ).unsqueeze(0)
                         result_inner = self.model(
                             next_token,
                             use_cache=use_cache,
@@ -212,26 +275,8 @@ class TextGenerator:
                     return None
 
                 token_ids = torch.cat((token_ids, next_token), dim=1)
-                current_pos += next_token.size(1)
-                if token_ids.size(1) > max_context:
-                    token_ids = token_ids[:, -max_context:]
-                if past_key_values is not None and len(past_key_values) > 0 and max_cache_len:
-                    cache_len = past_key_values[0][0].shape[2]
-                    if cache_len > max_cache_len:
-                        slice_len = cache_len - max_cache_len
-                        past_key_values = [
-                            (k[..., -max_cache_len:, :], v[..., -max_cache_len:, :])
-                            for k, v in past_key_values
-                        ]
-                        current_pos = max(0, current_pos - slice_len)
-
-                if past_key_values is not None:
-                    past_key_values = [
-                        (k[..., -max_context:, :], v[..., -max_context:, :])
-                        for k, v in past_key_values
-                    ]
-
-                current_pos = min(current_pos, token_ids.size(1))
+                absolute_pos += next_token.size(1)
+                _trim_context()
 
                 if logger.isEnabledFor(logging.DEBUG):
                     cache_lengths = [kv[0].shape[2] for kv in past_key_values] if past_key_values else []
@@ -245,44 +290,37 @@ class TextGenerator:
 
                 return logits_step
 
-            while forced_queue:
-                next_forced = forced_queue.pop(0)
-                current_logits = advance(next_forced, step_index, forced=True)
+            while generated < max_new_tokens:
+                logits_step = current_logits[:, -1, :] / temperature
+                logits_step = torch.clamp(logits_step, min=-1e4, max=1e4)
+
+                if top_k is not None:
+                    top_k_logits, _ = torch.topk(logits_step, min(top_k, logits_step.size(-1)))
+                    logits_step = logits_step.masked_fill(logits_step < top_k_logits[:, -1:], float('-inf'))
+
+                if top_p is not None:
+                    logits_step = self._apply_top_p_sampling(logits_step, top_p)
+
+                probs = F.softmax(logits_step, dim=-1)
+                if torch.any(torch.isnan(probs)) or torch.any(torch.isinf(probs)) or torch.any(probs < 0):
+                    logger.warning("Invalid probabilities detected during decoding; using uniform sampling")
+                    probs = torch.ones_like(probs) / probs.size(-1)
+
+                next_token = torch.multinomial(probs, num_samples=1)
+                current_logits = advance(next_token, step_index, forced=False)
                 if current_logits is None:
                     break
+
+                generated += 1
                 step_index += 1
-            else:
-                while generated < max_new_tokens:
-                    logits_step = current_logits[:, -1, :] / temperature
-                    logits_step = torch.clamp(logits_step, min=-1e4, max=1e4)
 
-                    if top_k is not None:
-                        top_k_logits, _ = torch.topk(logits_step, min(top_k, logits_step.size(-1)))
-                        logits_step = logits_step.masked_fill(logits_step < top_k_logits[:, -1:], float('-inf'))
-
-                    if top_p is not None:
-                        logits_step = self._apply_top_p_sampling(logits_step, top_p)
-
-                    probs = F.softmax(logits_step, dim=-1)
-                    if torch.any(torch.isnan(probs)) or torch.any(torch.isinf(probs)) or torch.any(probs < 0):
-                        logger.warning("Invalid probabilities detected during decoding; using uniform sampling")
-                        probs = torch.ones_like(probs) / probs.size(-1)
-
-                    next_token = torch.multinomial(probs, num_samples=1)
-                    current_logits = advance(next_token, step_index, forced=False)
-                    if current_logits is None:
-                        break
-
-                    generated += 1
-                    step_index += 1
-
-                    if stop_token is not None and (next_token == stop_token).any():
-                        logger.debug(
-                            "Stop token %d generated at step %d, stopping early",
-                            stop_token,
-                            step_index,
-                        )
-                        break
+                if stop_token is not None and (next_token == stop_token).any():
+                    logger.debug(
+                        "Stop token %d generated at step %d, stopping early",
+                        stop_token,
+                        step_index,
+                    )
+                    break
 
         # Log memory usage after generation
         try:
@@ -336,56 +374,30 @@ class TextGenerator:
         elif len(stop_tokens) != batch_size:
             raise ValueError(f"stop_tokens length ({len(stop_tokens)}) must match batch size ({batch_size})")
 
-        # Find maximum sequence length for padding
-        max_input_len = max(seq.size(0) for seq in token_ids_list)
+        results: List[torch.Tensor] = []
+        for idx, seq in enumerate(token_ids_list):
+            if seq.dim() == 1:
+                seq = seq.unsqueeze(0)
+            elif seq.dim() != 2 or seq.size(0) != 1:
+                raise ValueError(f"Each sequence must have shape (seq_len,) or (1, seq_len); got {seq.shape}")
 
-        # Pad sequences to same length
-        padded_inputs = []
-        attention_masks = []
-        for seq in token_ids_list:
-            pad_len = max_input_len - seq.size(0)
-            if pad_len > 0:
-                padded_seq = torch.cat([seq, torch.full((pad_len,), pad_token_id, dtype=seq.dtype, device=seq.device)], dim=0)
-                attention_mask = torch.cat([torch.ones(seq.size(0)), torch.zeros(pad_len)], dim=0)
+            seq = seq.to(self.device)
+            generated = self.generate(
+                seq,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                stop_token=stop_tokens[idx]
+            )[0]
+
+            orig_len = seq.size(1)
+            if generated.size(0) > orig_len:
+                new_tokens = generated[orig_len:]
             else:
-                padded_seq = seq
-                attention_mask = torch.ones(seq.size(0))
+                new_tokens = generated.new_empty((0,), dtype=generated.dtype)
 
-            padded_inputs.append(padded_seq)
-            attention_masks.append(attention_mask)
-
-        # Stack into batch
-        batch_input_ids = torch.stack(padded_inputs, dim=0).to(self.device)
-        batch_attention_mask = torch.stack(attention_masks, dim=0).to(self.device)
-
-        # Generate using the main generate method
-        # Note: This still uses the early-stopping behavior of the main method
-        # For truly independent generation, we'd need more complex batch handling
-        generated_batch = self.generate(
-            batch_input_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            stop_token=None,  # Disable global stop token
-            attention_mask=batch_attention_mask
-        )
-
-        # Split back into individual sequences
-        results = []
-        for i in range(batch_size):
-            seq = generated_batch[i]
-            # Remove padding tokens that were added
-            if i < len(token_ids_list):
-                orig_len = token_ids_list[i].size(0)
-                seq = seq[orig_len:]  # Remove original input
-                # Remove padding from generated part if present
-                if pad_token_id in seq:
-                    pad_idx = (seq == pad_token_id).nonzero(as_tuple=True)[0]
-                    if len(pad_idx) > 0:
-                        seq = seq[:pad_idx[0]]
-
-            results.append(seq)
+            results.append(new_tokens)
 
         return results
 

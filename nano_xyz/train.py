@@ -6,6 +6,7 @@
 
 import argparse
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -219,11 +220,18 @@ def train(
                 dist.init_process_group(backend='nccl', init_method='env://')
                 logger.info("Distributed training initialized")
 
-            # Get local rank for this process
-            local_rank = dist.get_rank()
             world_size = dist.get_world_size()
+            global_rank = dist.get_rank()
 
-            # Set device based on local rank
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA is required for DDP but is not available")
+
+            if "LOCAL_RANK" in os.environ:
+                local_rank = int(os.environ["LOCAL_RANK"])
+            else:
+                local_rank = global_rank % torch.cuda.device_count()
+
+            torch.cuda.set_device(local_rank)
             device = torch.device(f'cuda:{local_rank}')
             model = model.to(device)
             model = DDP(model, device_ids=[local_rank])
@@ -233,7 +241,7 @@ def train(
                 train_sampler = torch.utils.data.distributed.DistributedSampler(
                     train_loader.dataset,
                     num_replicas=world_size,
-                    rank=local_rank,
+                    rank=global_rank,
                     shuffle=True
                 )
                 train_loader = torch.utils.data.DataLoader(
@@ -245,7 +253,13 @@ def train(
                     drop_last=train_loader.drop_last
                 )
 
-            logger.info(f"DDP setup complete: rank {local_rank}/{world_size}, device {device}")
+            logger.info(
+                "DDP setup complete: global rank %d/%d, local rank %d, device %s",
+                global_rank,
+                world_size,
+                local_rank,
+                device,
+            )
 
         except ImportError:
             logger.warning("torch.distributed not available, falling back to single GPU training")
