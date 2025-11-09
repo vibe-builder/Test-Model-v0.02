@@ -796,7 +796,7 @@ class FocusedAttentionMechanism(nn.Module):
         else:  # Cross-attention: tensors already in (B, H, T, D) format
             T_q, T_kv = T_q, T_kv
 
-        cache_len = past_key_value[0].shape[2] if past_key_value is not None else 0
+        cache_len = past_key_value[0].shape[2] if (past_key_value is not None and past_key_value[0] is not None) else 0
 
         q, k = self._apply_rope_to_qk(
             q,
@@ -811,7 +811,7 @@ class FocusedAttentionMechanism(nn.Module):
         new_k_tokens = k
         new_v_tokens = v
 
-        concat_source = past_key_value if (past_key_value is not None and x is not None) else None
+        concat_source = past_key_value if (past_key_value is not None and past_key_value[0] is not None and x is not None) else None
         k, v, concatenated_cache_len = self._concat_past_kv(k, v, concat_source)
         if concat_source is not None:
             cache_len = concatenated_cache_len
@@ -1637,6 +1637,9 @@ class ModelArchitecture(nn.Module):
                 if isinstance(layer, TransformerLayer):
                     if past_key_values is not None and kv_index < len(past_key_values):
                         layer_past = past_key_values[kv_index]
+                        # Normalize empty tuple caches to None for first step compatibility
+                        if layer_past is not None and (layer_past[0] is None or layer_past[1] is None):
+                            layer_past = None
                     layer_cache_len = 0
                     if layer_past is not None and layer_past[0] is not None:
                         layer_cache_len = int(layer_past[0].shape[2])
