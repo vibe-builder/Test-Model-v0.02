@@ -1096,7 +1096,7 @@ class ModelSettings:
     dropout: float = DEFAULT_DROPOUT
     bias: bool = DEFAULT_BIAS
     n_kv_groups: Optional[int] = None
-    dtype: Optional[str] = None  # 'float16', 'bfloat16', 'float32', or None for auto-detect
+    dtype: Optional[Union[str, torch.dtype]] = None  # accept str or torch.dtype; normalized in __post_init__
     use_fused_attention: bool = True  # Gemma-2 style fused QKV projection
     attn_logit_softcapping: Optional[float] = None  # Gemma-2 feature: set None to prefer SDPA; set >0 to enable soft-capping
     use_fp32_softmax: bool = True  # Upcast softmax to FP32 for numerical stability
@@ -1142,13 +1142,22 @@ class ModelSettings:
             raise ValueError(
                 f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})"
             )
-        # Validate dtype
+        # Normalize and validate dtype
+        if isinstance(self.dtype, torch.dtype):
+            if self.dtype is torch.float16:
+                self.dtype = 'float16'
+            elif self.dtype is torch.bfloat16:
+                self.dtype = 'bfloat16'
+            elif self.dtype is torch.float32:
+                self.dtype = 'float32'
+            else:
+                self.dtype = 'float32'
         if self.dtype is not None:
             valid_dtypes = ['float16', 'bfloat16', 'float32']
-            if self.dtype not in valid_dtypes:
+            if str(self.dtype).lower() not in valid_dtypes:
                 raise ValueError(f"dtype must be one of {valid_dtypes}, got {self.dtype}")
         # Auto-detect dtype based on device capability if not specified
-        if self.dtype is None and torch.cuda.is_available():
+        if (self.dtype is None or str(self.dtype).lower() not in ['float16','bfloat16','float32']) and torch.cuda.is_available():
             # BF16 supported on Ampere+ (compute capability >= 8.0)
             props = torch.cuda.get_device_properties(0)
             compute_capability = props.major + props.minor / 10.0
@@ -1156,7 +1165,7 @@ class ModelSettings:
                 self.dtype = 'bfloat16'  # Better for training, less precision loss
             else:
                 self.dtype = 'float16'  # Works on older GPUs
-        elif self.dtype is None:
+        elif self.dtype is None or str(self.dtype).lower() not in ['float16','bfloat16','float32']:
             self.dtype = 'float32'  # CPU default
         valid_rope_types = {"auto", *ROPE_BUILDERS.keys()}
         self.rope_type = (self.rope_type or "auto").lower()

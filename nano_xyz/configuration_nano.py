@@ -6,6 +6,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from transformers import PretrainedConfig
+import torch
 
 from .model import DEFAULT_BLOCK_SIZE, DEFAULT_N_EMBD, DEFAULT_N_HEAD, DEFAULT_N_LAYER, ModelSettings
 
@@ -16,6 +17,12 @@ class NanoConfig(PretrainedConfig):
     """Configuration compatible with the Hugging Face ecosystem."""
 
     model_type = "nano_xyz"
+    # Map HF-standard fields to our internal names for better interoperability
+    attribute_map = {
+        "num_hidden_layers": "n_layer",
+        "num_attention_heads": "n_head",
+        "hidden_size": "n_embd",
+    }
 
     def __init__(
         self,
@@ -105,6 +112,22 @@ class NanoConfig(PretrainedConfig):
 
     def to_model_settings(self) -> ModelSettings:
         """Convert HF config into the internal ModelSettings dataclass."""
+        def _normalize_dtype(val):
+            if val is None:
+                return None
+            if isinstance(val, str):
+                v = val.lower()
+                if v in {"float16", "bfloat16", "float32"}:
+                    return v
+                return v
+            if isinstance(val, torch.dtype):
+                if val is torch.float16:
+                    return "float16"
+                if val is torch.bfloat16:
+                    return "bfloat16"
+                if val is torch.float32:
+                    return "float32"
+            return str(val)
         return ModelSettings(
             block_size=self.block_size,
             vocab_size=self.vocab_size,
@@ -114,7 +137,7 @@ class NanoConfig(PretrainedConfig):
             dropout=self.dropout,
             bias=self.bias,
             n_kv_groups=self.n_kv_groups,
-            dtype=self.dtype,
+            dtype=_normalize_dtype(self.dtype),
             use_fused_attention=self.use_fused_attention,
             attn_logit_softcapping=self.attn_logit_softcapping,
             use_fp32_softmax=self.use_fp32_softmax,
