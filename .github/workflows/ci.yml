@@ -1,0 +1,211 @@
+name: CI Pipeline for Nano XYZ
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Manual trigger for testing
+
+permissions:
+  checks: write  # For badges
+  pull-requests: write
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Verify PyTorch Version
+        run: python -c "import torch; assert torch.__version__ >= '2.6.0', f'PyTorch version {torch.__version__} too old'"
+
+      - name: Verify torchao compatibility
+        run: |
+          python -c "import torchao; print(f'TorchAO {torchao.__version__} loaded successfully')"
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      matrix:
+        device: [cpu, cuda]
+        nproc: [1]
+        include:
+          - device: cuda
+            nproc: 2  # Test multi-GPU only on CUDA
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest with coverage
+        env:
+          DEVICE: ${{ matrix.device }}
+          CUDA_VISIBLE_DEVICES: ${{ matrix.device == 'cuda' && '0' || '' }}
+        run: |
+          if [ "$DEVICE" = "cuda" ] && ! command -v nvidia-smi &> /dev/null; then
+            echo "Skipping CUDA tests - no GPU available"
+            exit 0
+          fi
+
+          if [ ${{ matrix.nproc }} -gt 1 ] && [ "$DEVICE" = "cuda" ]; then
+            echo "Running multi-GPU tests"
+            torchrun --nproc_per_node=${{ matrix.nproc }} -m pytest tests/ --cov=nano_xyz --cov-report=xml -v
+          else
+            echo "Running single-GPU/CPU tests"
+            pytest tests/ --cov=nano_xyz --cov-report=xml -v --tb=short
+          fi
+
+      - name: Upload coverage to Codecov
+        if: matrix.device == 'cpu' && matrix.nproc == 1
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install linters
+        run: pip install pylint black
+
+      - name: Run black (code formatting check)
+        run: black --check --diff nano_xyz/ tests/ profiling/
+
+      - name: Run pylint (code quality check)
+        run: pylint nano_xyz/ tests/ profiling/ --fail-under=8.0 --reports=y
+
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create artifacts directory
+        run: mkdir -p profiling/artifacts
+
+      - name: Run quick profiling
+        run: python profiling/profile_attention.py --seq_lens 1024 2048 --attention_types sparse --output_dir profiling/artifacts/
+
+      - name: Run quantization profiling
+        run: python profiling/profile_quantization.py --seq_lens 1024 --batch_sizes 1 --output profiling/artifacts/quantization_profile.json
+
+      - name: Upload profiling artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiling-results-${{ github.run_id }}
+          path: profiling/artifacts/
+          retention-days: 30
+
+  validate:
+    needs: [test, lint, profile]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate model sizes and compatibility
+        run: |
+          python -c "
+          from nano_xyz import NanoConfig
+          config = NanoConfig.from_preset('decoder_tiny')
+          print(f'Vocab size: {config.vocab_size}')
+          print(f'Model size: n_layer={config.n_layer}, n_embd={config.n_embd}')
+          print('Model configuration validation passed')
+          "
+
+      - name: Check memory efficiency targets
+        run: |
+          python -c "
+          # Validate that tiny model can fit in reasonable memory
+          from nano_xyz import NanoModel, NanoConfig
+          config = NanoConfig.from_preset('decoder_tiny')
+          model = NanoModel(config)
+
+          # Count parameters
+          total_params = sum(p.numel() for p in model.parameters())
+          print(f'Total parameters: {total_params:,}')
+
+          # Estimate memory usage (rough calculation)
+          param_memory = total_params * 4 / (1024**3)  # GB for float32
+          print(f'Estimated param memory: {param_memory:.2f} GB')
+
+          # Assert reasonable size for consumer hardware
+          assert total_params < 50_000_000, f'Model too large: {total_params} params'
+          print('Memory efficiency validation passed')
+          "
+
+      - name: Test consumer hardware compatibility
+        run: |
+          python -c "
+          # Test that model can run inference on reasonable inputs
+          import torch
+          from nano_xyz import NanoModel, NanoConfig
+
+          config = NanoConfig.from_preset('decoder_tiny')
+          config.use_torch_compile = False  # Skip compile for CI
+          model = NanoModel(config)
+
+          # Test with reasonable sequence length for consumer hardware
+          seq_len = 1024  # Should fit in 16GB VRAM
+          inputs = torch.randint(0, config.vocab_size, (1, seq_len))
+
+          with torch.no_grad():
+              outputs = model(inputs)
+
+          assert outputs.last_hidden_state.shape == (1, seq_len, config.n_embd)
+          print(f'Consumer hardware compatibility test passed: {seq_len} tokens')
+          "

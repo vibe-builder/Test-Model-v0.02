@@ -1,0 +1,26 @@
+[MASTER]
+disable=
+    C0114,  # missing-module-docstring - We have docstrings in key modules
+    C0115,  # missing-class-docstring - Classes have docstrings where needed
+    C0116,  # missing-function-docstring - Functions have docstrings where needed
+    R0903,  # too-few-public-methods - Common in configuration classes
+    R0913,  # too-many-arguments - ML models often need many config params
+    R0914,  # too-many-locals - Profiling functions need many variables
+    R0915,  # too-many-statements - Long profiling functions are necessary
+    C0103,  # invalid-name - Allow short variable names in ML code
+    W0613,  # unused-argument - Common in abstract method overrides
+    R0801,  # duplicate-code - Some duplication is acceptable in tests
+    C0209,  # consider-using-f-string - Allow .format() for compatibility
+    E1101,  # no-member - False positives with dynamic torch attributes
+
+[FORMAT]
+max-line-length=120
+good-names=i,j,k,x,y,z,_,ex,Run,q,k,v
+
+[REPORTS]
+output-format=text
+include-ids=yes
+reports=no
+
+[MESSAGES CONTROL]
+extension-pkg-whitelist=torch,numpy

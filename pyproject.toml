@@ -1,0 +1,34 @@
+[tool.black]
+line-length = 120
+target-version = ['py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+  | profiling/artifacts
+  | profiling/results
+)/
+'''
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = [
+    "tests"
+]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "gpu: marks tests that require GPU",
+    "quantization: marks quantization-related tests",
+]

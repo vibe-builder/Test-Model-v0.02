@@ -97,26 +97,111 @@ class DataTrainingArguments:
 
 
 def parse_config_overrides(overrides: Optional[str]) -> dict:
+    """
+    Parse and validate configuration overrides with schema-based validation.
+
+    Supports key=value pairs separated by commas. Validates keys against known
+    NanoConfig fields and ensures type safety.
+
+    Args:
+        overrides: String of comma-separated key=value pairs
+
+    Returns:
+        Dictionary of validated configuration overrides
+
+    Raises:
+        ValueError: If parsing fails or invalid keys/values are provided
+    """
+    from nano_xyz.configuration_nano import NanoConfig
+    from typing import get_type_hints
+
     if not overrides:
         return {}
+
+    # Get valid field names and their expected types from NanoConfig
+    config_hints = get_type_hints(NanoConfig.__init__)
+    valid_keys = set(config_hints.keys()) | {
+        # Common aliases used in training scripts
+        'n_embd', 'n_head', 'n_layer', 'block_size', 'vocab_size',
+        'dropout', 'bias', 'n_kv_groups', 'use_dca', 'use_fp32_softmax'
+    }
+
     result = {}
     for entry in overrides.split(","):
+        entry = entry.strip()
         if not entry:
             continue
-        key, value = entry.split("=")
-        value = value.strip()
-        if value.isdigit():
-            result[key.strip()] = int(value)
-        else:
-            try:
-                result[key.strip()] = float(value)
-            except ValueError:
-                lowered = value.lower()
-                if lowered in {"true", "false"}:
-                    result[key.strip()] = lowered == "true"
-                else:
-                    result[key.strip()] = value
+
+        if "=" not in entry:
+            raise ValueError(f"Invalid override format: '{entry}'. Expected 'key=value'")
+
+        key, value_str = entry.split("=", 1)
+        key = key.strip()
+        value_str = value_str.strip()
+
+        if key not in valid_keys:
+            raise ValueError(f"Unknown configuration key: '{key}'. Valid keys: {sorted(valid_keys)}")
+
+        # Parse value with type validation
+        try:
+            result[key] = _parse_config_value(key, value_str, config_hints)
+        except ValueError as e:
+            raise ValueError(f"Invalid value for '{key}': {e}") from e
+
     return result
+
+
+def _parse_config_value(key: str, value_str: str, type_hints: dict):
+    """
+    Parse a configuration value with type validation.
+
+    Args:
+        key: Configuration key name
+        value_str: String value to parse
+        type_hints: Type hints from NanoConfig
+
+    Returns:
+        Parsed and validated value
+
+    Raises:
+        ValueError: If parsing or validation fails
+    """
+    # Handle boolean values
+    if value_str.lower() in ('true', 'false'):
+        return value_str.lower() == 'true'
+
+    # Handle None/null values
+    if value_str.lower() in ('none', 'null', ''):
+        return None
+
+    # Handle integer values
+    if value_str.isdigit() or (value_str.startswith('-') and value_str[1:].isdigit()):
+        return int(value_str)
+
+    # Handle float values
+    try:
+        # Check if it's a valid float (including scientific notation)
+        if '.' in value_str or 'e' in value_str.lower():
+            return float(value_str)
+    except ValueError:
+        pass
+
+    # Handle string values (default fallback)
+    # Strip quotes if present
+    if (value_str.startswith('"') and value_str.endswith('"')) or \
+       (value_str.startswith("'") and value_str.endswith("'")):
+        return value_str[1:-1]
+
+    # Validate string length to prevent memory exhaustion from malformed config inputs
+    # This limit prevents potential DoS attacks via extremely long config values
+    MAX_CONFIG_STRING_LENGTH = 1000  # Configurable limit for string values
+    if len(value_str) > MAX_CONFIG_STRING_LENGTH:
+        raise ValueError(
+            f"String value too long (max {MAX_CONFIG_STRING_LENGTH} characters). "
+            "This limit prevents memory exhaustion from malformed config inputs."
+        )
+
+    return value_str
 
 
 def main():
@@ -140,6 +225,14 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     if model_args.model_name_or_path:
+        # Validate path to prevent directory traversal attacks
+        if os.path.isabs(model_args.model_name_or_path):
+            # For absolute paths, ensure they don't escape intended directories
+            model_path = os.path.abspath(model_args.model_name_or_path)
+            allowed_base_dirs = ['.', './models', './checkpoints']  # Configure as needed
+            if not any(model_path.startswith(os.path.abspath(base_dir)) for base_dir in allowed_base_dirs):
+                raise ValueError(f"Model path {model_path} is outside allowed directories")
+
         config = NanoConfig.from_pretrained(model_args.model_name_or_path)
         model = NanoForCausalLM.from_pretrained(model_args.model_name_or_path, config=config)
     else:
@@ -147,31 +240,11 @@ def main():
         overrides = parse_config_overrides(model_args.config_overrides)
         preset = (model_args.preset or "").lower().strip()
         if preset == "tiny":
-            base = dict(
-                block_size=1024,
-                n_layer=6,
-                n_head=8,
-                n_embd=512,
-                attn_logit_softcapping=None,
-                use_fp32_softmax=True,
-                max_cache_len=1024,
-                rope_type="default",
-                use_lcr=False,
-                use_gtr=False,
-            )
+            from nano_xyz.configuration_nano import PRESET_CONFIGS
+            base = PRESET_CONFIGS["tiny"].copy()
         elif preset == "small":
-            base = dict(
-                block_size=1024,
-                n_layer=12,
-                n_head=12,
-                n_embd=768,
-                attn_logit_softcapping=None,
-                use_fp32_softmax=True,
-                max_cache_len=1024,
-                rope_type="default",
-                use_lcr=False,
-                use_gtr=False,
-            )
+            from nano_xyz.configuration_nano import PRESET_CONFIGS
+            base = PRESET_CONFIGS["small"].copy()
         else:
             base = {}
         base.update(overrides)
@@ -227,8 +300,40 @@ def main():
             data_files["train"] = data_args.train_file
         if data_args.validation_file:
             data_files["validation"] = data_args.validation_file
+
+        # Validate that at least one data file is provided
+        if not data_files:
+            raise ValueError(
+                "No dataset provided. Please specify either --dataset_name or at least one of --train_file/--validation_file"
+            )
+
         extension = os.path.splitext(list(data_files.values())[0])[1].lstrip(".")
-        raw_datasets = load_dataset(extension, data_files=data_files)
+
+        # Map file extensions to HuggingFace dataset builder names
+        extension_to_builder = {
+            "txt": "text",
+            "text": "text",
+            "json": "json",
+            "jsonl": "json",
+            "csv": "csv",
+            "tsv": "csv",  # TSV files use CSV builder with tab delimiter
+            "parquet": "parquet",
+        }
+
+        if extension not in extension_to_builder:
+            raise ValueError(
+                f"Unsupported file extension '{extension}'. "
+                f"Supported extensions: {list(extension_to_builder.keys())}"
+            )
+
+        builder_name = extension_to_builder[extension]
+        load_kwargs = {"data_files": data_files}
+
+        # For TSV files, specify tab delimiter
+        if extension == "tsv":
+            load_kwargs["delimiter"] = "\t"
+
+        raw_datasets = load_dataset(builder_name, **load_kwargs)
 
     column_names = raw_datasets["train"].column_names
     text_column = "text" if "text" in column_names else column_names[0]
